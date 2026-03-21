@@ -3,7 +3,7 @@ import logging
 import os
 import re
 import threading
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 import duckdb
 
@@ -68,12 +68,15 @@ class DatabaseClient:
         self._conn_initialized = False
 
     def _ensure_connected(self) -> None:
+        if self._ephemeral_connections:
+            return
+
         """Lazily initialize the database connection on first use."""
         if not self._conn_initialized:
             self._conn_initialized = True
             self.conn = self._initialize_connection()
 
-    def _initialize_connection(self) -> Optional[duckdb.DuckDBPyConnection]:
+    def _initialize_connection(self) -> duckdb.DuckDBPyConnection:
         """Initialize connection to the MotherDuck or DuckDB database"""
 
         logger.info(f"🔌 Connecting to {self.db_type} database")
@@ -90,18 +93,17 @@ class DatabaseClient:
                     config={"custom_user_agent": f"mcp-server-motherduck/{SERVER_VERSION}"},
                     read_only=self._read_only,
                 )
-                conn.execute("SELECT 1")
 
                 if self._ephemeral_connections:
-                    # Default: close connection for concurrent access
-                    conn.close()
-                    return None
+                    # User requested persistent connection via --no-ephemeral-connections
+                    logger.info("Using ephemeral read-only connection")
                 else:
                     # User requested persistent connection via --no-ephemeral-connections
                     logger.info("Using persistent read-only connection")
-                    # Execute init SQL
-                    self._execute_init_sql(conn)
-                    return conn
+
+                # Execute init SQL
+                self._execute_init_sql(conn)
+                return conn
             except Exception as e:
                 logger.error(f"❌ Read-only check failed: {e}")
                 raise
@@ -276,18 +278,18 @@ class DatabaseClient:
 
         return db_path, "duckdb"
 
+    def _initialize_ephemeral_connection(self) -> duckdb.DuckDBPyConnection:
+        logger.info("Init ephemeral connection")
+        return self._initialize_connection()
+
     def _execute(self, query: str) -> dict[str, Any]:
         """Execute query and return JSON-serializable result."""
         self._ensure_connected()
+
         # Get connection to use
-        if self.conn is None:
-            conn = duckdb.connect(
-                self.db_path,
-                config={"custom_user_agent": f"mcp-server-motherduck/{SERVER_VERSION}"},
-                read_only=self._read_only,
-            )
-        else:
-            conn = self.conn
+        conn = self.conn
+        if conn is None:
+            conn = self._initialize_ephemeral_connection()
 
         try:
             # Execute with or without timeout
@@ -395,14 +397,11 @@ class DatabaseClient:
         Used by catalog tools that need custom result formatting.
         """
         self._ensure_connected()
-        if self.conn is None:
-            conn = duckdb.connect(
-                self.db_path,
-                config={"custom_user_agent": f"mcp-server-motherduck/{SERVER_VERSION}"},
-                read_only=self._read_only,
-            )
-        else:
-            conn = self.conn
+
+        # Get connection to use
+        conn = self.conn
+        if conn is None:
+            conn = self._initialize_ephemeral_connection()
 
         try:
             q = conn.execute(query)
